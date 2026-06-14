@@ -322,11 +322,8 @@ fn try_fill_gaps(
         for &(w, h, rot) in &[(spec.width, spec.height, false), (spec.height, spec.width, true)] {
             let mut found = false;
 
-            // Умный поиск: сначала вдоль границ, затем с большим шагом
-            let step = w.min(h).max(5); // Адаптивный шаг
-
-            'search: for y in (0..=page_height.saturating_sub(h)).step_by(step as usize) {
-                for x in (0..=page_width.saturating_sub(w)).step_by(step as usize) {
+            'search: for y in 0..=page_height.saturating_sub(h) {
+                for x in 0..=page_width.saturating_sub(w) {
                     // Проверяем пересечения
                     let mut overlaps = false;
                     for item in placed.iter().chain(additional_items.iter()) {
@@ -359,6 +356,48 @@ fn try_fill_gaps(
     } else {
         None
     }
+}
+
+fn try_local_swap(
+    page_width: u32,
+    page_height: u32,
+    placed: &mut Vec<PlacedItem>,
+    specs: &[ElementType],
+    remaining: &mut Vec<u32>,
+) -> bool {
+    let unplaced: u32 = remaining.iter().sum();
+    if unplaced == 0 { return false; }
+
+    for remove_idx in 0..placed.len() {
+        let removed = placed[remove_idx].clone();
+        let spec_idx = match specs.iter().position(|s| s.name == removed.name) {
+            Some(i) => i,
+            None => continue,
+        };
+        placed.remove(remove_idx);
+        remaining[spec_idx] += 1;
+
+        if let Some(extra) = try_fill_gaps(page_width, page_height, placed, specs, remaining) {
+            let newly_placed: u32 = extra.len() as u32;
+            let new_unplaced: u32 = remaining.iter().sum::<u32>()
+                - extra.iter().map(|it| {
+                    specs.iter().filter(|s| s.name == it.name).count() as u32
+                  }).sum::<u32>();
+            if newly_placed > 1 || new_unplaced < unplaced {
+                for it in &extra {
+                    for (i, s) in specs.iter().enumerate() {
+                        if s.name == it.name { remaining[i] -= 1; break; }
+                    }
+                }
+                placed.extend(extra);
+                return true;
+            }
+        }
+
+        placed.insert(remove_idx, removed);
+        remaining[spec_idx] -= 1;
+    }
+    false
 }
 
 fn save_result(task_id: usize, sol: &Solution, target_area: u64) {
@@ -424,7 +463,7 @@ fn main() {
                 // Устанавливаем флаг таймаута
                 if elapsed >= timeout_secs {
                     TIMEOUT_REACHED.store(true, Ordering::Relaxed);
-                    println!("\n   ⏱️ Таймаут {} сек достигнут!", timeout_secs);
+                    println!("\n   Таймаут {} сек достигнут!", timeout_secs);
                     break;
                 }
             }
@@ -434,13 +473,13 @@ fn main() {
     for (task_i, cfg) in configs.iter().enumerate() {
         // Проверяем таймаут перед началом задачи
         if TIMEOUT_REACHED.load(Ordering::Relaxed) {
-            println!("\n⏱️ Таймаут достигнут. Пропуск оставшихся задач.");
+            println!("\nТаймаут достигнут. Пропуск оставшихся задач.");
             break;
         }
 
         let task_id = task_i + 1;
         let total_items_to_place: u32 = cfg.elements.iter().map(|e| e.count).sum();
-        println!("\n🚀 ЗАДАЧА #{} [{}x{}]", task_id, cfg.page_width, cfg.page_height);
+        println!("\nЗАДАЧА #{} [{}x{}]", task_id, cfg.page_width, cfg.page_height);
         println!("   Цель: разместить {} деталей.", total_items_to_place);
 
         let mut specs = cfg.elements.clone();
@@ -585,12 +624,25 @@ fn main() {
             }
         }
 
+        // Локальный swap: убрать 1 деталь и заменить на 2 меньших
+        {
+            let swapped = try_local_swap(
+                cfg.page_width, cfg.page_height,
+                &mut final_sol.items, &specs, &mut final_sol.remaining_counts,
+            );
+            if swapped {
+                final_sol.total_area = final_sol.items.iter()
+                    .map(|p| p.width as u64 * p.height as u64).sum();
+                println!("   [SWAP] Локальное улучшение нашло лучшую раскладку!");
+            }
+        }
+
         let final_eff = (final_sol.total_area as f64 / target_area as f64) * 100.0;
-        println!("\n✅ ЗАДАЧА #{} ЗАВЕРШЕНА. Итог: {:.4}%", task_id, final_eff);
+        println!("\nЗАДАЧА #{} ЗАВЕРШЕНА. Итог: {:.4}%", task_id, final_eff);
 
         // ВСЕГДА сохраняем финальный результат
         save_result(task_id, &final_sol, target_area);
-        println!("   📁 Результат сохранён в result_task_{}.json", task_id);
+        println!("   Результат сохранён в result_task_{}.json", task_id);
 
         // Автоматически запускаем визуализацию
         let result_file = format!("result_task_{}.json", task_id);
@@ -599,9 +651,9 @@ fn main() {
             .args(["visualize.py", &result_file, "--config", &args.file, "--task", &task_idx])
             .status();
         match vis_status {
-            Ok(s) if s.success() => println!("   🖼️  Схема сохранена в result_task_{}.png", task_id),
-            Ok(_) => eprintln!("   ⚠️  visualize.py завершился с ошибкой"),
-            Err(e) => eprintln!("   ⚠️  Не удалось запустить python3: {}", e),
+            Ok(s) if s.success() => println!("   Схема сохранена в result_task_{}.png", task_id),
+            Ok(_) => eprintln!("   visualize.py завершился с ошибкой"),
+            Err(e) => eprintln!("   Не удалось запустить python3: {}", e),
         }
     }
 
@@ -615,13 +667,13 @@ fn main() {
 
     while !monitor_handle.is_finished() {
         if join_start.elapsed() > join_timeout {
-            eprintln!("⚠️ Поток мониторинга не завершился за 2 секунды, принудительное завершение");
+            eprintln!("Поток мониторинга не завершился за 2 секунды, принудительное завершение");
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    println!("\n🏁 Программа завершена. Общее время: {:.1} сек", start.elapsed().as_secs_f64());
+    println!("\nПрограмма завершена. Общее время: {:.1} сек", start.elapsed().as_secs_f64());
 
     // Убиваем все дочерние потоки rayon
     drop(monitor_handle);
