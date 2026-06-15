@@ -1,1 +1,13 @@
 /target
+webapp/runs/
+webapp/server.log
+__pycache__/
+*.pyc
+
+# Локальные настройки Claude Code
+.claude/
+
+# Сгенерированные артефакты раскладки (создаются на лету)
+result_task_*.json
+result_task_*.png
+*.tmp

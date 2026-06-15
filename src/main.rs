@@ -75,6 +75,11 @@ struct Args {
     timeout_seconds: u64,
     #[arg(short = 'b', long, default_value = "12")]
     beam_width: usize,
+    #[arg(short = 'j', long, default_value = "0")]
+    threads: usize,
+    /// Лимит (сек) на goal-driven фазу принудительного размещения. 0 = пропустить.
+    #[arg(short = 'g', long, default_value = "90")]
+    goal_driven_seconds: u64,
 }
 
 // Глобальные переменные мониторинга
@@ -84,6 +89,18 @@ static FOUND_PERFECT: AtomicBool = AtomicBool::new(false);
 static BRANCHES_PROCESSED: AtomicU32 = AtomicU32::new(0);
 static TOTAL_ITERATIONS: AtomicU64 = AtomicU64::new(0);
 static TIMEOUT_REACHED: AtomicBool = AtomicBool::new(false);
+
+// Доля (%) узлов, где blink-диверсификация исключает лучшего кандидата из луча.
+const BLINK_PCT: u64 = 15;
+
+// Быстрый детерминированный хэш для blink-перемешивания (без внешних крейтов).
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
 
 // ============================================================================
 // ЭВРИСТИКА
@@ -172,6 +189,7 @@ fn solve_recursive(
     start_time: &Instant,
     timeout: &Duration,
     beam_width: usize,
+    blink_seed: u64,
 ) -> Option<Solution> {
     TOTAL_ITERATIONS.fetch_add(1, Ordering::Relaxed);
 
@@ -233,6 +251,20 @@ fn solve_recursive(
     if candidates.is_empty() { return Some(best_solution); }
     candidates.sort_by(|a, b| b.4.cmp(&a.4));
 
+    // Blink-диверсификация (GDRR): с вероятностью BLINK_PCT% исключаем лучшего
+    // кандидата из луча. Разные seed -> разные ветви поиска при перезапусках.
+    if blink_seed != 0 && candidates.len() >= 2 {
+        let h = splitmix64(blink_seed
+            ^ (width as u64).wrapping_mul(0x9E3779B97F4A7C15)
+            ^ (height as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)
+            ^ (depth as u64).wrapping_mul(0x165667B19E3779F9)
+            ^ total_remaining as u64);
+        if h % 100 < BLINK_PCT {
+            let first = candidates.remove(0);
+            candidates.push(first);
+        }
+    }
+
     // Адаптивная ширина луча: более агрессивная на средних глубинах
     let current_beam = if depth < 3 {
         beam_width
@@ -255,8 +287,8 @@ fn solve_recursive(
 
         for split_vertical in splits {
             let res = if split_vertical {
-                solve_recursive(width - item_w, item_h, &new_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width).and_then(|res_r| {
-                    solve_recursive(width, height - item_h, &res_r.remaining_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width).map(|res_b| {
+                solve_recursive(width - item_w, item_h, &new_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width, blink_seed).and_then(|res_r| {
+                    solve_recursive(width, height - item_h, &res_r.remaining_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width, blink_seed).map(|res_b| {
                         let total = item_area + res_r.total_area + res_b.total_area;
                         let mut items = vec![PlacedItem { x: 0, y: 0, width: item_w, height: item_h, name: item_specs[idx].name.clone(), rotated }];
                         for mut p in res_r.items { p.x += item_w; items.push(p); }
@@ -265,8 +297,8 @@ fn solve_recursive(
                     })
                 })
             } else {
-                solve_recursive(item_w, height - item_h, &new_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width).and_then(|res_b| {
-                    solve_recursive(width - item_w, height, &res_b.remaining_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width).map(|res_r| {
+                solve_recursive(item_w, height - item_h, &new_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width, blink_seed).and_then(|res_b| {
+                    solve_recursive(width - item_w, height, &res_b.remaining_counts, item_specs, memo, depth + 1, start_time, timeout, beam_width, blink_seed).map(|res_r| {
                         let total = item_area + res_b.total_area + res_r.total_area;
                         let mut items = vec![PlacedItem { x: 0, y: 0, width: item_w, height: item_h, name: item_specs[idx].name.clone(), rotated }];
                         for mut p in res_b.items { p.y += item_h; items.push(p); }
@@ -358,6 +390,106 @@ fn try_fill_gaps(
     }
 }
 
+#[derive(Clone, Debug)]
+struct Rect {
+    x: u32, y: u32, w: u32, h: u32,
+}
+
+fn get_max_free_rects(
+    page_width: u32,
+    page_height: u32,
+    placed: &[PlacedItem],
+) -> Vec<Rect> {
+    let mut free_rects = vec![Rect { x: 0, y: 0, w: page_width, h: page_height }];
+    
+    for p in placed {
+        let mut new_free = Vec::new();
+        for f in free_rects {
+            if p.x < f.x + f.w && p.x + p.width > f.x &&
+               p.y < f.y + f.h && p.y + p.height > f.y {
+                if p.x > f.x { new_free.push(Rect { x: f.x, y: f.y, w: p.x - f.x, h: f.h }); }
+                if p.x + p.width < f.x + f.w { new_free.push(Rect { x: p.x + p.width, y: f.y, w: f.x + f.w - (p.x + p.width), h: f.h }); }
+                if p.y > f.y { new_free.push(Rect { x: f.x, y: f.y, w: f.w, h: p.y - f.y }); }
+                if p.y + p.height < f.y + f.h { new_free.push(Rect { x: f.x, y: p.y + p.height, w: f.w, h: f.y + f.h - (p.y + p.height) }); }
+            } else {
+                new_free.push(f);
+            }
+        }
+        
+        let mut maximal = Vec::new();
+        for i in 0..new_free.len() {
+            let mut is_contained = false;
+            for j in 0..new_free.len() {
+                if i != j {
+                    let r1 = &new_free[i];
+                    let r2 = &new_free[j];
+                    if r1.x >= r2.x && r1.y >= r2.y && r1.x + r1.w <= r2.x + r2.w && r1.y + r1.h <= r2.y + r2.h {
+                        is_contained = true;
+                        break;
+                    }
+                }
+            }
+            if !is_contained { maximal.push(new_free[i].clone()); }
+        }
+        free_rects = maximal;
+    }
+    free_rects
+}
+
+fn pack_remaining_items_backtracking(
+    page_width: u32,
+    page_height: u32,
+    placed: &[PlacedItem],
+    specs: &[ElementType],
+    remaining: &mut [u32],
+    iters: &mut u32,
+) -> Option<Vec<PlacedItem>> {
+    *iters += 1;
+    if *iters > 50_000 { return None; }
+
+    let unplaced: u32 = remaining.iter().sum();
+    if unplaced == 0 { return Some(Vec::new()); }
+    
+    let mut free_rects = get_max_free_rects(page_width, page_height, placed);
+    free_rects.sort_by_key(|f| (f.y, f.x));
+    
+    let mut best_spec_idx = None;
+    let mut best_area = 0;
+    for (i, &count) in remaining.iter().enumerate() {
+        if count > 0 {
+            let area = specs[i].width * specs[i].height;
+            if area > best_area {
+                best_area = area;
+                best_spec_idx = Some(i);
+            }
+        }
+    }
+    
+    let spec_idx = best_spec_idx.unwrap();
+    let spec = &specs[spec_idx];
+    
+    for &(w, h, rot) in &[(spec.width, spec.height, false), (spec.height, spec.width, true)] {
+        if w == h && rot { continue; }
+        
+        for f in &free_rects {
+            if w <= f.w && h <= f.h {
+                let p = PlacedItem { x: f.x, y: f.y, width: w, height: h, name: spec.name.clone(), rotated: rot };
+                let mut new_placed = placed.to_vec();
+                new_placed.push(p.clone());
+                remaining[spec_idx] -= 1;
+                
+                if let Some(mut rest) = pack_remaining_items_backtracking(page_width, page_height, &new_placed, specs, remaining, iters) {
+                    rest.push(p);
+                    remaining[spec_idx] += 1;
+                    return Some(rest);
+                }
+                remaining[spec_idx] += 1;
+            }
+        }
+    }
+    None
+}
+
 fn try_local_swap(
     page_width: u32,
     page_height: u32,
@@ -368,37 +500,49 @@ fn try_local_swap(
     let unplaced: u32 = remaining.iter().sum();
     if unplaced == 0 { return false; }
 
-    for remove_idx in 0..placed.len() {
-        let removed = placed[remove_idx].clone();
-        let spec_idx = match specs.iter().position(|s| s.name == removed.name) {
-            Some(i) => i,
-            None => continue,
-        };
-        placed.remove(remove_idx);
-        remaining[spec_idx] += 1;
+    println!("   [DP POST-PROCESSING] Start Large Neighborhood Search with MaxRects...");
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
 
-        if let Some(extra) = try_fill_gaps(page_width, page_height, placed, specs, remaining) {
-            let newly_placed: u32 = extra.len() as u32;
-            let new_unplaced: u32 = remaining.iter().sum::<u32>()
-                - extra.iter().map(|it| {
-                    specs.iter().filter(|s| s.name == it.name).count() as u32
-                  }).sum::<u32>();
-            if newly_placed > 1 || new_unplaced < unplaced {
-                for it in &extra {
-                    for (i, s) in specs.iter().enumerate() {
-                        if s.name == it.name { remaining[i] -= 1; break; }
-                    }
-                }
-                placed.extend(extra);
-                return true;
+    for iter in 0..1000 {
+        let window_w = rng.gen_range(50..350);
+        let window_h = rng.gen_range(50..350);
+        let wx = rng.gen_range(0..=page_width.saturating_sub(window_w));
+        let wy = rng.gen_range(0..=page_height.saturating_sub(window_h));
+        
+        let mut removed_items = Vec::new();
+        let mut keep_items = Vec::new();
+        
+        for item in placed.iter() {
+            if item.x < wx + window_w && item.x + item.width > wx &&
+               item.y < wy + window_h && item.y + item.height > wy {
+                removed_items.push(item.clone());
+            } else {
+                keep_items.push(item.clone());
             }
         }
-
-        placed.insert(remove_idx, removed);
-        remaining[spec_idx] -= 1;
+        
+        let current_unplaced: u32 = unplaced + removed_items.len() as u32;
+        if current_unplaced > 12 { continue; } 
+        
+        let mut temp_remaining = remaining.clone();
+        for item in &removed_items {
+            if let Some(spec_idx) = specs.iter().position(|s| s.name == item.name) {
+                temp_remaining[spec_idx] += 1;
+            }
+        }
+        
+        if let Some(packed) = pack_remaining_items_backtracking(page_width, page_height, &keep_items, specs, &mut temp_remaining, &mut 0) {
+            println!("   [УСПЕХ] MaxRects LNS packed all {} items after {} iterations!", current_unplaced, iter);
+            *placed = keep_items;
+            placed.extend(packed);
+            for c in remaining.iter_mut() { *c = 0; }
+            return true;
+        }
     }
     false
 }
+
 
 fn save_result(task_id: usize, sol: &Solution, target_area: u64) {
     let efficiency = (sol.total_area as f64 / target_area as f64) * 100.0;
@@ -411,15 +555,146 @@ fn save_result(task_id: usize, sol: &Solution, target_area: u64) {
         "items": sol.items,
         "unplaced_count": sol.remaining_counts.iter().sum::<u32>()
     });
-    // Прямая запись с немедленным закрытием файла
-    if let Ok(mut file) = std::fs::File::create(&out_file) {
-        let _ = serde_json::to_writer_pretty(&mut file, &output);
-        let _ = file.sync_all(); // Гарантируем запись на диск
+    // Атомарная запись: пишем во временный файл, синхронизируем на диск и
+    // переименовываем. rename атомарен в пределах ФС, поэтому читатель (веб)
+    // никогда не увидит обрезанный JSON — даже если процесс прибьют по таймауту.
+    // Имя .tmp УНИКАЛЬНО на каждую запись: save_result вызывается параллельно из
+    // множества rayon-потоков, и общий .tmp приводил бы к перемешанным записям.
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_file = format!("{}.{}.{}.tmp", out_file, std::process::id(), seq ^ nanos as u64);
+    if let Ok(mut file) = std::fs::File::create(&tmp_file) {
+        if serde_json::to_writer_pretty(&mut file, &output).is_ok() {
+            let _ = file.sync_all(); // Гарантируем запись на диск
+            drop(file);
+            if std::fs::rename(&tmp_file, &out_file).is_err() {
+                let _ = std::fs::remove_file(&tmp_file);
+            }
+        } else {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp_file);
+        }
     }
+}
+
+// ============================================================================
+// GOAL-DRIVEN FORCED PLACEMENT
+// ============================================================================
+// Принудительно ставит трудную деталь первым ходом в угол листа, режет лист на
+// 2 подпрямоугольника и заполняет их полным перебором с blink-диверсификацией.
+// Множество параллельных перезапусков с разными seed дают разные раскладки —
+// это позволяет разместить деталь, недостижимую для детерминированного поиска.
+fn goal_driven_forced(
+    page_w: u32,
+    page_h: u32,
+    specs: &[ElementType],
+    full_counts: &[u32],
+    forced_indices: &[usize],
+    beam_width: usize,
+    deadline: Duration,
+) -> Option<Solution> {
+    let total_items: u32 = full_counts.iter().sum();
+    let target_area = page_w as u64 * page_h as u64;
+
+    // Конфигурации: трудная деталь × ориентация × направление гильотинного реза.
+    let mut configs: Vec<(usize, u32, u32, bool, bool)> = Vec::new();
+    for &fidx in forced_indices {
+        let (w, h) = (specs[fidx].width, specs[fidx].height);
+        for &(fw, fh, rot) in &[(w, h, false), (h, w, true)] {
+            if fw > page_w || fh > page_h { continue; }
+            if rot && w == h { continue; }
+            configs.push((fidx, fw, fh, rot, true));   // рез по вертикали
+            configs.push((fidx, fw, fh, rot, false));  // рез по горизонтали
+        }
+    }
+    if configs.is_empty() { return None; }
+
+    // После основного поиска флаги выставлены в true — сбрасываем, иначе
+    // solve_recursive внутри немедленно вернёт None.
+    FOUND_PERFECT.store(false, Ordering::SeqCst);
+    TIMEOUT_REACHED.store(false, Ordering::SeqCst);
+
+    let start = Instant::now();
+    let best: Arc<Mutex<Option<Solution>>> = Arc::new(Mutex::new(None));
+
+    let mut seed_base: u64 = 1;
+    let batch: u64 = 48;
+    while start.elapsed() < deadline && !FOUND_PERFECT.load(Ordering::Relaxed) {
+        let jobs: Vec<(u64, usize)> = (seed_base..seed_base + batch)
+            .flat_map(|s| (0..configs.len()).map(move |ci| (s, ci)))
+            .collect();
+
+        jobs.into_par_iter().for_each(|(seed, ci)| {
+            if start.elapsed() > deadline || FOUND_PERFECT.load(Ordering::Relaxed) { return; }
+            let (fidx, fw, fh, rotated, cut_v) = configs[ci];
+            let mut lc = full_counts.to_vec();
+            lc[fidx] -= 1;
+            let mut memo: MemoCache = HashMap::new();
+            let item_area = fw as u64 * fh as u64;
+
+            let res = if cut_v {
+                solve_recursive(page_w - fw, fh, &lc, specs, &mut memo, 1, &start, &deadline, beam_width, seed).and_then(|rr| {
+                    solve_recursive(page_w, page_h - fh, &rr.remaining_counts, specs, &mut memo, 1, &start, &deadline, beam_width, seed).map(|rb| {
+                        let mut items = vec![PlacedItem { x: 0, y: 0, width: fw, height: fh, name: specs[fidx].name.clone(), rotated }];
+                        for mut p in rr.items { p.x += fw; items.push(p); }
+                        for mut p in rb.items { p.y += fh; items.push(p); }
+                        Solution { items, remaining_counts: rb.remaining_counts, total_area: item_area + rr.total_area + rb.total_area }
+                    })
+                })
+            } else {
+                solve_recursive(fw, page_h - fh, &lc, specs, &mut memo, 1, &start, &deadline, beam_width, seed).and_then(|rb| {
+                    solve_recursive(page_w - fw, page_h, &rb.remaining_counts, specs, &mut memo, 1, &start, &deadline, beam_width, seed).map(|rr| {
+                        let mut items = vec![PlacedItem { x: 0, y: 0, width: fw, height: fh, name: specs[fidx].name.clone(), rotated }];
+                        for mut p in rb.items { p.y += fh; items.push(p); }
+                        for mut p in rr.items { p.x += fw; items.push(p); }
+                        Solution { items, remaining_counts: rr.remaining_counts, total_area: item_area + rb.total_area + rr.total_area }
+                    })
+                })
+            };
+
+            if let Some(sol) = res {
+                let placed = sol.items.len();
+                let mut g = best.lock().unwrap();
+                let better = match g.as_ref() {
+                    None => true,
+                    Some(b) => placed > b.items.len() || (placed == b.items.len() && sol.total_area > b.total_area),
+                };
+                if better {
+                    let all_placed = placed as u32 == total_items;
+                    let eff = sol.total_area as f64 / target_area as f64 * 100.0;
+                    println!("\n   [GOAL-DRIVEN] Деталей: {}/{} | Заполнение: {:.4}% (seed {})", placed, total_items, eff, seed);
+                    *g = Some(sol);
+                    if all_placed { FOUND_PERFECT.store(true, Ordering::SeqCst); }
+                }
+            }
+        });
+
+        seed_base += batch;
+    }
+
+    let result = best.lock().unwrap().clone();
+    TIMEOUT_REACHED.store(true, Ordering::SeqCst);
+    result
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Настраиваем пул потоков rayon
+    if args.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .expect("Ошибка инициализации пула потоков");
+        println!("Потоков: {}", args.threads);
+    } else {
+        println!("Потоков: {} (авто)", rayon::current_num_threads());
+    }
+
     let content = std::fs::read_to_string(&args.file).expect("Ошибка чтения файла");
     let configs: Vec<Config> = serde_json::from_str(&content).expect("Ошибка парсинга JSON");
 
@@ -481,6 +756,7 @@ fn main() {
         let total_items_to_place: u32 = cfg.elements.iter().map(|e| e.count).sum();
         println!("\nЗАДАЧА #{} [{}x{}]", task_id, cfg.page_width, cfg.page_height);
         println!("   Цель: разместить {} деталей.", total_items_to_place);
+        println!("   Останавливаемся при: таймаут {}с | все детали размещены | заполнение ≥99%", args.timeout_seconds);
 
         let mut specs = cfg.elements.clone();
 
@@ -549,8 +825,8 @@ fn main() {
                 }
 
                 let res = if split_v {
-                    solve_recursive(cfg.page_width - item_w, item_h, &local_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width).and_then(|res_r| {
-                        solve_recursive(cfg.page_width, cfg.page_height - item_h, &res_r.remaining_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width).map(|res_b| {
+                    solve_recursive(cfg.page_width - item_w, item_h, &local_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width, 0).and_then(|res_r| {
+                        solve_recursive(cfg.page_width, cfg.page_height - item_h, &res_r.remaining_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width, 0).map(|res_b| {
                             let mut items = vec![PlacedItem { x: 0, y: 0, width: item_w, height: item_h, name: specs[idx].name.clone(), rotated }];
                             for mut p in res_r.items { p.x += item_w; items.push(p); }
                             for mut p in res_b.items { p.y += item_h; items.push(p); }
@@ -558,8 +834,8 @@ fn main() {
                         })
                     })
                 } else {
-                    solve_recursive(item_w, cfg.page_height - item_h, &local_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width).and_then(|res_b| {
-                        solve_recursive(cfg.page_width - item_w, cfg.page_height, &res_b.remaining_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width).map(|res_r| {
+                    solve_recursive(item_w, cfg.page_height - item_h, &local_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width, 0).and_then(|res_b| {
+                        solve_recursive(cfg.page_width - item_w, cfg.page_height, &res_b.remaining_counts, &specs, &mut local_memo, 1, &start, &timeout, args.beam_width, 0).map(|res_r| {
                             let mut items = vec![PlacedItem { x: 0, y: 0, width: item_w, height: item_h, name: specs[idx].name.clone(), rotated }];
                             for mut p in res_b.items { p.y += item_h; items.push(p); }
                             for mut p in res_r.items { p.x += item_w; items.push(p); }
@@ -588,7 +864,8 @@ fn main() {
                         // Сохраняем немедленно
                         save_result(task_id, &sol, target_area);
 
-                        if sol.total_area == target_area {
+                        // Останавливаемся при 100% заполнении или ≥99%
+                        if sol.total_area >= target_area * 99 / 100 {
                             FOUND_PERFECT.store(true, Ordering::SeqCst);
                         }
                     }
@@ -634,6 +911,31 @@ fn main() {
                 final_sol.total_area = final_sol.items.iter()
                     .map(|p| p.width as u64 * p.height as u64).sum();
                 println!("   [SWAP] Локальное улучшение нашло лучшую раскладку!");
+            }
+        }
+
+        // GOAL-DRIVEN: принудительное размещение нерешённых деталей с blink-диверсификацией
+        let still_unplaced: u32 = final_sol.remaining_counts.iter().sum();
+        if still_unplaced > 0 && args.goal_driven_seconds > 0 {
+            let forced: Vec<usize> = final_sol.remaining_counts.iter()
+                .enumerate().filter(|(_, &c)| c > 0).map(|(i, _)| i).collect();
+            let gd_deadline = Duration::from_secs(args.goal_driven_seconds);
+            let gd_beam = args.beam_width.max(16);
+            println!("\n   [GOAL-DRIVEN] Принудительное размещение {} нерешённых деталей (до {}с, beam {})...",
+                still_unplaced, gd_deadline.as_secs(), gd_beam);
+            if let Some(gd) = goal_driven_forced(cfg.page_width, cfg.page_height, &specs, &counts, &forced, gd_beam, gd_deadline) {
+                let better = gd.items.len() > final_sol.items.len()
+                    || (gd.items.len() == final_sol.items.len() && gd.total_area > final_sol.total_area);
+                if better {
+                    println!("   [GOAL-DRIVEN] УЛУЧШЕНИЕ: {} -> {} деталей | {} -> {} мм²",
+                        final_sol.items.len(), gd.items.len(), final_sol.total_area, gd.total_area);
+                    final_sol = gd;
+                } else {
+                    println!("   [GOAL-DRIVEN] Улучшения не найдено (лучшее форсингом: {}/{} деталей).",
+                        gd.items.len(), total_items_to_place);
+                }
+            } else {
+                println!("   [GOAL-DRIVEN] Решений не получено.");
             }
         }
 
